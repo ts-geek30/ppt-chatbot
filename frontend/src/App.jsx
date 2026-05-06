@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import UploadTemplate from "./UploadTemplate";
 import ChatWindow from "./ChatWindow";
 
-const API = "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 export default function App() {
   const [sessionId, setSessionId] = useState(null);
