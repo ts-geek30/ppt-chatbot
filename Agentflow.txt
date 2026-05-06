@@ -1,0 +1,201 @@
+SlideAI — Agent Flow (Current Implementation)
+==============================================
+
+Step 1 — User Opens the App
+─────────────────────────────
+Frontend calls GET /new-session → receives a unique session_id (UUID)
+session_id is saved in localStorage so it persists across page refreshes
+Each user has their own isolated session — templates never mix between users
+
+
+Step 2 — User Uploads PPT Template
+────────────────────────────────────
+User drops or selects a .pptx file
+        ↓
+POST /upload-template  (multipart: file + session_id)
+        ↓
+ppt_parser.py opens the file with python-pptx and inspects every slide:
+
+  For each slide it extracts:
+    - Slide number
+    - Layout name  (e.g. "Title Slide", "Title and Content", "Section Header")
+    - Title placeholder text  (idx 0 / type TITLE or CENTER_TITLE)
+    - Whether a fillable body placeholder exists  (idx ≥ 1, type BODY/OBJECT)
+    - Body placeholder hint text  (first 100 chars of existing content)
+    - Estimated character capacity  (calculated from shape width × height ÷ font size)
+
+  Placeholder classification rules:
+    - TITLE_TYPES  = {1, 13}   → title placeholder
+    - BODY_TYPES   = {2, 7, 15} → fillable content area
+    - SKIP_TYPES   = {3, 4, 10, 11, 12, 14} → date / footer / slide number (never touched)
+
+  Converts to a compact LLM-readable string, e.g.:
+    "Slide 1 | Layout: Title Slide | Title: Company Name | Body: fillable (capacity ~180 chars)
+     Slide 2 | Layout: Title and Content | Title: Agenda | Body: fillable (capacity ~420 chars)
+       Placeholder idx=1 hint: 01 Introduction..."
+
+  Stored in session_store dict keyed by session_id
+  Original .pptx file saved to /tmp/slideai_uploads/<session_id>.pptx for later PPT creation
+
+At this point the agent knows the exact structure, placeholder layout, and
+character capacity of every slide in the template.
+
+
+Step 3 — User Pastes Raw Data  (Two-Stage Multi-Agent Pipeline)
+────────────────────────────────────────────────────────────────
+User pastes raw unstructured content in the chat input
+        ↓
+POST /process-data  (session_id + raw_data)
+        ↓
+agent.py fetches the stored slide structure for that session_id
+        ↓
+Streams 4 progress steps to the frontend via SSE:
+  1. "Reading your raw data..."
+  2. "Analyzing slide structure..."
+  3. "Building content outline..."
+  4. "Writing slide content..."
+
+── STAGE 1: Outline Agent ──────────────────────────────────────────────────
+
+  Single LLM call (temperature=0.1 for consistency)
+  Model: meta/llama-3.1-405b-instruct via NVIDIA API
+
+  System prompt instructs the model to act as a "presentation architect":
+    - Classify each slide as: title / agenda / section / content / data / closing
+    - Identify the topic and key points for each slide from the raw data
+    - Set a char_limit per slide based on the capacity hint from the structure
+    - Output every slide in the structure (empty key_points if no content fits)
+    - Return ONLY valid JSON — no markdown, no explanation
+
+  Input:  slide_structure string + raw_data string
+  Output: JSON outline array, one entry per slide:
+    {
+      "outline": [
+        {
+          "slide_number": 1,
+          "slide_type": "title",
+          "topic": "Excel-to-Automated S&OP Platform",
+          "key_points": ["Highest Priority — Quick Win + Strong ROI"],
+          "char_limit": 180
+        },
+        ...
+      ]
+    }
+
+── STAGE 2: Content Agent (concurrent, one call per slide) ─────────────────
+
+  One LLM call per slide, all fired concurrently with asyncio.gather()
+  Same model, temperature=0.1
+
+  System prompt instructs the model to act as a "slide content writer":
+    - Write final presentation-ready text for exactly one slide
+    - Plain text only — no markdown, no bold, no headers
+    - Stay within the char_limit from the outline
+    - Return JSON: { "slide_title": "...", "suggested_content": "..." }
+
+  Input per call:  slide_type, topic, key_points[], char_limit
+  Output per call: { slide_title, suggested_content }
+
+  Post-processing:
+    - Strip any residual markdown from all text fields
+    - Hard-truncate suggested_content to char_limit if exceeded
+    - Sort results by slide_number
+    - Deduplicate (keep first occurrence per slide_number)
+
+  If a per-slide call fails, falls back to joining key_points directly
+  so no slide is ever silently dropped
+
+  Final result streamed to frontend as SSE event:
+    { "type": "result", "data": { "slides": [...] } }
+
+  Each slide object:
+    { slide_number, slide_title, suggested_content, reason }
+
+
+Step 4 — Frontend Renders Slide Cards
+───────────────────────────────────────
+Each slide mapping renders as a card in the chat:
+  - Slide number badge
+  - Slide title
+  - Content preview (first 3 lines, with bullet rendering)
+  - "Refine" hint on hover → opens SlideChat modal
+
+User can paste more raw data and the agent re-maps against the same template.
+
+
+Step 5 — Per-Slide Refinement Chat  (Optional)
+───────────────────────────────────────────────
+User clicks a slide card → SlideChat modal opens
+
+  SlideChat shows:
+    - Read-only slide context (number, title, current content)
+    - Scrollable message history for that slide
+    - Text input for refinement instructions
+
+  User types instruction (e.g. "make this more concise")
+        ↓
+  POST /refine-slide  (session_id, slide_number, slide_title, current_content,
+                       instruction, chat_history[])
+        ↓
+  Single LLM call with:
+    - System: slide context embedded (avoids consecutive human messages)
+    - MessagesPlaceholder: prior chat_history as HumanMessage/AIMessage objects
+    - Human: new instruction
+        ↓
+  Returns refined_content string (plain text)
+        ↓
+  Frontend appends AI response to message list
+  "Apply to Slide" button becomes active
+        ↓
+  User clicks Apply → suggested_content updated in parent message's slides array
+  SlideChat closes, main view shows updated slide card
+
+  Chat history is preserved in frontend state (slideHistories keyed by slide_number)
+  so reopening the same slide restores the full conversation
+
+
+Step 6 — Generate & Download PPT
+──────────────────────────────────
+User clicks "Generate PPT" on the bot message
+        ↓
+POST /create-ppt  (session_id + slides[])
+        ↓
+ppt_creator.py opens the original uploaded template from disk
+
+  For each slide mapping:
+    1. Find title placeholder  (idx 0 / type TITLE or CENTER_TITLE)
+       → write slide_title
+    2. Find body placeholders  (idx ≥ 1, sorted by idx so primary body first)
+       → write suggested_content line by line
+
+  Text writing strategy (preserves template formatting):
+    - Extract rPr (run properties) from first existing run → reference font
+    - Clear the text frame cleanly (remove all runs, keep paragraph XML structure)
+    - Write first line into existing first paragraph (preserves pPr: spacing, indent, bullets)
+    - Clone paragraph structure for each additional line (fresh <a:r> run, same pPr)
+    - Never touch non-placeholder shapes (images, decorative elements, backgrounds)
+
+  If agent mapped more slides than the template has:
+    - Find best content slide to clone (has both title + body placeholder)
+    - Clone and append for each extra slide number needed
+
+  Saves output to /tmp/slideai_outputs/slideai_<uuid>.pptx
+  Returns as FileResponse download
+
+User can also click "Preview" to render slides as images via LibreOffice
+and view them in the PPTPreview modal before downloading.
+
+
+Key Design Points
+──────────────────
+- Two-stage pipeline: Outline Agent → Content Agents (concurrent)
+  mirrors how Gamma/AiPPT work — outline first, fill each slide in isolation
+- Character capacity is calculated from actual placeholder dimensions
+  so content is sized to fit the real text box, not a generic limit
+- Placeholder targeting by idx (not shape order) ensures correct shape is filled
+  even in complex multi-column or custom layouts
+- The LLM never sees the actual PPT file — only the extracted text structure
+- Frontend owns chat_history for refinement — backend is stateless per refinement call
+- Every user has their own session_id — templates never mix between users
+- Model: meta/llama-3.1-405b-instruct via NVIDIA API (integrate.api.nvidia.com/v1)
+  temperature=0.1 for structured output consistency
