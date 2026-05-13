@@ -96,15 +96,16 @@ def scan_template(template_path: str) -> list[dict]:
         entry = {
             "slide_number":      slide_num,
             "title_shape_name":  None,
-            "body_shape_name":   None,
+            "body_shape_name":   None,   # kept for backward compat
+            "body_shape_names":  [],     # NEW: all body shapes
             "title_hint":        "",
             "body_hint":         "",
             "has_placeholder":   False,
         }
 
         # ── Pass 1: try PowerPoint placeholders ──────────────────────────
-        title_ph = None
-        body_ph  = None
+        title_ph  = None
+        body_phs  = []
         for shape in slide.shapes:
             if not shape.is_placeholder or not shape.has_text_frame:
                 continue
@@ -117,17 +118,19 @@ def scan_template(template_path: str) -> list[dict]:
                 if title_ph is None:
                     title_ph = shape
             elif pt not in {3, 4, 10, 11, 12, 14} and idx >= 1:
-                if body_ph is None:
-                    body_ph = shape
+                body_phs.append(shape)
 
-        if title_ph or body_ph:
+        if title_ph or body_phs:
             entry["has_placeholder"] = True
             if title_ph:
                 entry["title_shape_name"] = title_ph.name
                 entry["title_hint"]       = title_ph.text_frame.text.strip()[:80]
-            if body_ph:
-                entry["body_shape_name"] = body_ph.name
-                entry["body_hint"]       = body_ph.text_frame.text.strip()[:80]
+            if body_phs:
+                # Sort by left position so left column comes first
+                body_phs.sort(key=lambda s: getattr(s, "left", 0))
+                entry["body_shape_name"]  = body_phs[0].name
+                entry["body_shape_names"] = [s.name for s in body_phs]
+                entry["body_hint"]        = body_phs[0].text_frame.text.strip()[:80]
             result.append(entry)
             continue
 
@@ -192,10 +195,13 @@ def scan_template(template_path: str) -> list[dict]:
         ]
 
         if body_candidates:
-            # Pick the one with the most text content (template placeholder text)
-            body_info = max(body_candidates, key=lambda s: len(s["text"]))
-            entry["body_shape_name"] = body_info["shape"].name
-            entry["body_hint"]       = body_info["text"][:80]
+            # Sort by left position so left column comes first
+            body_candidates.sort(key=lambda s: s["left"])
+            # Pick up to 2 body shapes (covers two-column layouts)
+            selected_bodies = body_candidates[:2]
+            entry["body_shape_name"]  = selected_bodies[0]["shape"].name
+            entry["body_shape_names"] = [s["shape"].name for s in selected_bodies]
+            entry["body_hint"]        = selected_bodies[0]["text"][:80]
 
         result.append(entry)
 
@@ -233,6 +239,33 @@ def _write_text(shape, lines: list[str]):
         if ref_size:
             break
 
+    # --- Dynamic Font Scaling (Safety Net) ---
+    if ref_size and shape.width and shape.height:
+        full_text = "\n".join(lines)
+        current_pt = ref_size / 12700.0
+        min_pt = 12.0
+        
+        # Iteratively shrink font if content likely overflows
+        while current_pt > min_pt:
+            width_pt = shape.width / 12700.0
+            height_pt = shape.height / 12700.0
+            # Heuristic: 0.6pt width per char, 1.5x font size for line height
+            chars_per_line = max(15, int(width_pt / (current_pt * 0.6)))
+            est_lines = max(1, int(height_pt / (current_pt * 1.5)))
+            capacity = chars_per_line * est_lines
+            
+            if len(full_text) <= capacity:
+                break
+            
+            current_pt -= 2.0  # shrink by 2pt increments
+            if current_pt < min_pt:
+                current_pt = min_pt
+            ref_size = int(current_pt * 12700)
+            logger.info(f"      Overflow protection: shrinking font to {current_pt:.1f}pt for '{shape.name}'")
+            if current_pt == min_pt:
+                break
+
+
     # Clear all paragraphs down to one
     while len(tf.paragraphs) > 1:
         last_p = tf.paragraphs[-1]._p
@@ -265,6 +298,37 @@ def _apply_font(run, size, color):
             run.font.color.rgb = color
     except Exception:
         pass
+
+# ---------------------------------------------------------------------------
+# Multi-body content splitter
+# ---------------------------------------------------------------------------
+
+def _split_content_for_layout(lines: list[str], layout_type: str, n_bodies: int) -> list[list[str]]:
+    """
+    Split content lines across multiple body shapes based on layout type.
+    - two_column / comparison: split at midpoint (left col / right col)
+    - kpi: one metric per shape
+    - default: all content to first shape, rest empty
+    """
+    if n_bodies <= 1:
+        return [lines]
+
+    if layout_type in ("two_column", "comparison"):
+        mid = max(1, len(lines) // 2)
+        chunks = [lines[:mid], lines[mid:]]
+        # Pad to n_bodies
+        while len(chunks) < n_bodies:
+            chunks.append([])
+        return chunks[:n_bodies]
+
+    if layout_type == "kpi":
+        # Distribute one line per shape
+        chunks = [[lines[i]] if i < len(lines) else [] for i in range(n_bodies)]
+        return chunks
+
+    # Default: all to first shape
+    result = [lines] + [[] for _ in range(n_bodies - 1)]
+    return result
 
 # ---------------------------------------------------------------------------
 # Slide cloning
@@ -329,7 +393,14 @@ def create_ppt_from_template(
                If None, scan_template() is called here (slower but safe).
     """
     prs = Presentation(template_path)
-    content_map = {int(m["slide_number"]): m for m in slide_mappings}
+    content_map = {}
+    for m in slide_mappings:
+        try:
+            num = int(float(str(m.get("slide_number", 0))))
+            content_map[num] = m
+        except (ValueError, TypeError):
+            continue
+
 
     # Build shape_map if not provided
     if shape_map is None:
@@ -368,31 +439,37 @@ def create_ppt_from_template(
         title_text    = _strip_markdown(str(mapping.get("slide_title",      "")).strip())
         content_text  = _strip_markdown(str(mapping.get("suggested_content", "")).strip())
         content_lines = [l.strip() for l in content_text.splitlines() if l.strip()]
+        layout_type   = mapping.get("layout_type", "content")
 
-        logger.info(f"Slide {slide_num}: title='{title_text[:50]}', lines={len(content_lines)}")
+        logger.info(f"Slide {slide_num}: title='{title_text[:50]}', lines={len(content_lines)}, layout={layout_type}")
 
-        # Get the pre-computed shape names for this slide
-        smap = shape_index.get(slide_num, {})
-        title_name = smap.get("title_shape_name")
-        body_name  = smap.get("body_shape_name")
+        smap          = shape_index.get(slide_num, {})
+        title_name    = smap.get("title_shape_name")
+        # Support both old single body_shape_name and new multi body_shape_names list
+        body_names_raw = smap.get("body_shape_names") or (
+            [smap["body_shape_name"]] if smap.get("body_shape_name") else []
+        )
 
-        logger.info(f"  target shapes: title='{title_name}', body='{body_name}'")
+        logger.info(f"  target shapes: title='{title_name}', bodies={body_names_raw}")
 
-        # Build a name→shape lookup for this slide
         shape_by_name = {s.name: s for s in slide.shapes if s.has_text_frame}
 
-        title_shape = shape_by_name.get(title_name) if title_name else None
-        body_shape  = shape_by_name.get(body_name)  if body_name  else None
+        title_shape  = shape_by_name.get(title_name) if title_name else None
+        body_shapes  = [shape_by_name[n] for n in body_names_raw if n in shape_by_name]
 
         if title_shape and title_text:
             _write_text(title_shape, [title_text])
         elif not title_shape:
             logger.warning(f"  Slide {slide_num}: title shape '{title_name}' not found")
 
-        if body_shape and content_lines:
-            _write_text(body_shape, content_lines)
-        elif not body_shape:
-            logger.warning(f"  Slide {slide_num}: body shape '{body_name}' not found")
+        if body_shapes and content_lines:
+            # Split content across multiple body shapes for multi-column layouts
+            split_content = _split_content_for_layout(content_lines, layout_type, len(body_shapes))
+            for body_shape, lines_chunk in zip(body_shapes, split_content):
+                if lines_chunk:
+                    _write_text(body_shape, lines_chunk)
+        elif not body_shapes:
+            logger.warning(f"  Slide {slide_num}: no body shapes found from {body_names_raw}")
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(output_dir, f"slideai_{uuid.uuid4().hex[:8]}.pptx")
