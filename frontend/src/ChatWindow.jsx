@@ -2,10 +2,13 @@ import React, { useState, useRef, useEffect } from "react";
 import PPTPreview from "./PPTPreview";
 import SlideChat from "./SlideChat";
 
-const STEP_ICONS = { reading: "📄", analyzing: "🔍", mapping: "🗂️", refining: "✨" };
+const STEP_ICONS = { analysing: "🔬", strategising: "🧠", writing: "✍️", validating: "🔍", formatting: "✨" };
+
+const TONES = ["General", "Executive", "Technical", "Sales"];
 
 export default function ChatWindow({ sessionId, apiBase }) {
   const [rawData, setRawData]               = useState("");
+  const [tone, setTone]                     = useState("General");
   const [messages, setMessages]             = useState([]);
   const [loading, setLoading]               = useState(false);
   const [steps, setSteps]                   = useState([]);
@@ -25,7 +28,7 @@ export default function ChatWindow({ sessionId, apiBase }) {
     try {
       const res = await fetch(`${apiBase}/process-data`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, raw_data: text }),
+        body: JSON.stringify({ session_id: sessionId, raw_data: text, tone }),
       });
       const reader = res.body.getReader(); const decoder = new TextDecoder(); let buf = "";
       while (true) {
@@ -41,7 +44,12 @@ export default function ChatWindow({ sessionId, apiBase }) {
             const slides = (chunk.data.slides || []).filter((sl) => {
               if (seen.has(sl.slide_number)) return false; seen.add(sl.slide_number); return true;
             });
-            setMessages((p) => [...p, { role: "bot", slides, askPPT: true }]); setSteps([]);
+            setMessages((p) => [...p, {
+              role: "bot", slides, askPPT: true,
+              qualityScore: chunk.data.quality_score,
+              issuesFound:  chunk.data.issues_found,
+              tone:         chunk.data.tone,
+            }]); setSteps([]);
           } else if (chunk.type === "error") {
             setMessages((p) => [...p, { role: "bot", error: chunk.message }]); setSteps([]);
           }
@@ -118,6 +126,7 @@ export default function ChatWindow({ sessionId, apiBase }) {
                 slides={msg.slides} error={msg.error} askPPT={msg.askPPT}
                 pptLoading={msg.pptLoading} downloadUrl={msg.downloadUrl}
                 pptError={msg.pptError} previewLoading={msg.previewLoading}
+                qualityScore={msg.qualityScore} issuesFound={msg.issuesFound} tone={msg.tone}
                 onSlideClick={(slide) => openSlideChat(slide, i)}
                 onCreatePPT={() => handleCreatePPT(msg.slides, i)}
                 onDeclinePPT={() => handleDeclinePPT(i)}
@@ -132,6 +141,18 @@ export default function ChatWindow({ sessionId, apiBase }) {
 
       <div style={s.inputBar}>
         <div style={s.inputWrap}>
+          <div style={s.toneRow}>
+            <span style={s.toneLabel}>Tone:</span>
+            {TONES.map((t) => (
+              <button
+                key={t}
+                onClick={() => setTone(t)}
+                style={{ ...s.toneBtn, ...(tone === t ? s.toneBtnActive : {}) }}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
           <textarea
             value={rawData} onChange={(e) => setRawData(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) handleSubmit(); }}
@@ -210,9 +231,12 @@ function UserBubble({ text }) {
 
 // ── Agent Steps ──────────────────────────────────────────
 function AgentSteps({ steps }) {
-  const allSteps = ["reading", "analyzing", "mapping", "refining"];
-  const doneSet  = new Set(steps.map((s) => s.step));
-  const current  = steps.length > 0 ? steps[steps.length - 1] : null;
+  const allSteps = ["analysing", "strategising", "writing", "validating", "formatting"];
+  // A step is "done" when we've received a status:"done" event for it
+  const doneSet  = new Set(steps.filter((s) => s.status === "done").map((s) => s.step));
+  // Current = last step with status:"running"
+  const running  = steps.filter((s) => s.status === "running");
+  const current  = running.length > 0 ? running[running.length - 1] : null;
   return (
     <div style={as.row}>
       <div style={bb.avatar}>AI</div>
@@ -244,7 +268,9 @@ function AgentSteps({ steps }) {
 }
 
 // ── Bot Bubble ───────────────────────────────────────────
-function BotBubble({ slides, error, askPPT, pptLoading, downloadUrl, pptError, previewLoading, onSlideClick, onCreatePPT, onDeclinePPT, onPreview }) {
+function BotBubble({ slides, error, askPPT, pptLoading, downloadUrl, pptError, previewLoading,
+  qualityScore, issuesFound, tone,
+  onSlideClick, onCreatePPT, onDeclinePPT, onPreview }) {
   return (
     <div style={bb.row}>
       <div style={bb.avatar}>AI</div>
@@ -255,7 +281,20 @@ function BotBubble({ slides, error, askPPT, pptLoading, downloadUrl, pptError, p
           <>
             <div style={bb.introRow}>
               <p style={bb.intro}>Mapped content to <strong style={{ color: "#818cf8" }}>{slides.length} slides</strong></p>
-              <span style={bb.introHint}>Click any card to refine with AI →</span>
+              <div style={bb.introBadges}>
+                {qualityScore != null && (
+                  <span style={{ ...bb.qualityBadge, ...(qualityScore >= 8 ? bb.qualityGood : bb.qualityWarn) }}>
+                    {qualityScore >= 8 ? "✓" : "⚠"} Quality {qualityScore}/10
+                  </span>
+                )}
+                {issuesFound > 0 && (
+                  <span style={bb.fixedBadge}>🔧 {issuesFound} issue{issuesFound > 1 ? "s" : ""} auto-fixed</span>
+                )}
+                {tone && tone !== "General" && (
+                  <span style={bb.toneBadge}>🎯 {tone}</span>
+                )}
+                <span style={bb.introHint}>Click any card to refine →</span>
+              </div>
             </div>
 
             <div style={bb.grid}>
@@ -337,17 +376,23 @@ function BotBubble({ slides, error, askPPT, pptLoading, downloadUrl, pptError, p
 function SlideCard({ slide, onClick }) {
   const [hovered, setHovered] = useState(false);
   const lines = slide.suggested_content?.split("\n").filter(Boolean) || [];
+  const conf  = slide.confidence ?? 1.0;
+  const confColor = conf >= 0.8 ? "#34d399" : conf >= 0.5 ? "#fbbf24" : "#f87171";
+  const confLabel = conf >= 0.8 ? "High" : conf >= 0.5 ? "Medium" : "Low";
   return (
     <div
-      style={{ ...sc.card, ...(hovered ? sc.cardHover : {}) }}
+      style={{ ...sc.card, ...(hovered ? sc.cardHover : {}), ...(conf < 0.5 ? sc.cardLowConf : {}) }}
       onClick={onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      <div style={sc.accent} />
+      <div style={{ ...sc.accent, background: conf < 0.5 ? "linear-gradient(180deg,#f87171,#fbbf24)" : "linear-gradient(180deg,#818cf8,#c084fc)" }} />
       <div style={sc.head}>
         <span style={sc.badge}>Slide {slide.slide_number}</span>
         <span style={sc.title}>{slide.slide_title}</span>
+        <span style={{ ...sc.confBadge, color: confColor, borderColor: confColor + "44", background: confColor + "11" }}>
+          {confLabel}
+        </span>
         <span style={{ ...sc.editHint, ...(hovered ? sc.editHintVisible : {}) }}>
           <svg width="11" height="11" viewBox="0 0 24 24" fill="none">
             <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
@@ -395,6 +440,16 @@ const s = {
   sendBtn: { display: "flex", alignItems: "center", gap: 7, background: "linear-gradient(135deg, #4f46e5, #7c3aed)", border: "none", borderRadius: 10, color: "#fff", fontSize: 13, fontWeight: 600, padding: "9px 18px", cursor: "pointer", boxShadow: "0 4px 14px rgba(99,102,241,0.35)" },
   sendBtnOff: { opacity: 0.4, cursor: "not-allowed", boxShadow: "none" },
   spinner: { width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)", borderTop: "2px solid #fff", borderRadius: "50%", display: "inline-block", animation: "spin 0.8s linear infinite" },
+  toneRow: { display: "flex", alignItems: "center", gap: 6, padding: "10px 14px 0", flexWrap: "wrap" },
+  toneLabel: { fontSize: 11, color: "#475569", fontWeight: 600, marginRight: 2 },
+  toneBtn: {
+    fontSize: 11, fontWeight: 500, padding: "4px 10px", borderRadius: 20, cursor: "pointer",
+    background: "rgba(30,41,59,0.6)", border: "1px solid rgba(51,65,85,0.5)", color: "#64748b",
+    transition: "all 0.15s",
+  },
+  toneBtnActive: {
+    background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.4)", color: "#818cf8",
+  },
 };
 
 const es = {
@@ -427,7 +482,13 @@ const bb = {
   content: { flex: 1, minWidth: 0 },
   introRow: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, flexWrap: "wrap", gap: 6 },
   intro: { fontSize: 13, color: "#64748b" },
+  introBadges: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
   introHint: { fontSize: 11, color: "#334155" },
+  qualityBadge: { fontSize: 10, fontWeight: 700, borderRadius: 20, padding: "2px 8px", border: "1px solid" },
+  qualityGood: { background: "rgba(52,211,153,0.1)", color: "#34d399", borderColor: "rgba(52,211,153,0.3)" },
+  qualityWarn: { background: "rgba(251,191,36,0.1)", color: "#fbbf24", borderColor: "rgba(251,191,36,0.3)" },
+  fixedBadge: { fontSize: 10, fontWeight: 700, borderRadius: 20, padding: "2px 8px", background: "rgba(99,102,241,0.1)", border: "1px solid rgba(99,102,241,0.25)", color: "#818cf8" },
+  toneBadge:  { fontSize: 10, fontWeight: 700, borderRadius: 20, padding: "2px 8px", background: "rgba(139,92,246,0.1)", border: "1px solid rgba(139,92,246,0.25)", color: "#c084fc" },
   grid: { display: "flex", flexDirection: "column", gap: 8 },
   error: { background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", borderRadius: 10, padding: "12px 16px", color: "#fca5a5", fontSize: 13 },
 };
@@ -435,10 +496,12 @@ const bb = {
 const sc = {
   card: { position: "relative", background: "rgba(15,23,42,0.75)", border: "1px solid rgba(99,102,241,0.1)", borderRadius: 12, padding: "14px 16px 14px 20px", overflow: "hidden", cursor: "pointer", transition: "border-color 0.2s, transform 0.15s, background 0.2s" },
   cardHover: { borderColor: "rgba(99,102,241,0.35)", transform: "translateY(-1px)", background: "rgba(15,23,42,0.9)" },
+  cardLowConf: { borderColor: "rgba(251,191,36,0.2)" },
   accent: { position: "absolute", left: 0, top: 0, bottom: 0, width: 3, background: "linear-gradient(180deg, #818cf8, #c084fc)", borderRadius: "3px 0 0 3px" },
   head: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" },
   badge: { background: "rgba(99,102,241,0.12)", border: "1px solid rgba(99,102,241,0.22)", color: "#818cf8", borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 700, flexShrink: 0 },
   title: { color: "#e2e8f0", fontWeight: 600, fontSize: 13, flex: 1 },
+  confBadge: { fontSize: 9, fontWeight: 700, borderRadius: 20, padding: "2px 7px", border: "1px solid", flexShrink: 0 },
   editHint: { display: "flex", alignItems: "center", gap: 4, fontSize: 11, color: "#334155", opacity: 0, transition: "opacity 0.2s", marginLeft: "auto" },
   editHintVisible: { opacity: 1, color: "#818cf8" },
   body: { display: "flex", flexDirection: "column", gap: 4 },

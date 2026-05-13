@@ -43,7 +43,6 @@ def is_fillable_body(shape) -> bool:
     idx = ph_idx(shape)
     if pt in SKIP_TYPES:
         return False
-    # idx 1 = primary body; idx 2+ = secondary content areas (multi-column etc.)
     if idx is not None and idx >= 1:
         return True
     if pt in BODY_TYPES:
@@ -51,16 +50,52 @@ def is_fillable_body(shape) -> bool:
     return False
 
 
-def _emu_to_chars(width_emu: int, height_emu: int, font_pt: float = 18.0) -> int:
+def _read_font_pt(shape, fallback: float = 16.0) -> float:
     """
-    Rough estimate of how many characters fit in a text box.
-    Assumes ~1.6 chars per point of font width, ~1.4 lines per point of height.
+    Read the actual font size from a shape's text frame.
+    Falls back to `fallback` if no explicit size is set.
+    This fixes the previous hardcoded 18pt default which underestimated capacity by ~20%.
+    """
+    if not shape.has_text_frame:
+        return fallback
+    for para in shape.text_frame.paragraphs:
+        for run in para.runs:
+            try:
+                sz = run.font.size
+                if sz and sz > 0:
+                    pt = sz / 12700.0
+                    # Sanity check: ignore unrealistic sizes
+                    if 6.0 <= pt <= 72.0:
+                        return pt
+            except Exception:
+                pass
+    return fallback
+
+
+def _emu_to_chars(width_emu: int, height_emu: int, font_pt: float) -> dict:
+    """
+    Estimate how many characters fit in a text box given its actual font size.
+    Returns capacity and spatial hints.
     """
     width_pt  = width_emu  / 12700.0
     height_pt = height_emu / 12700.0
-    chars_per_line = max(20, int(width_pt / (font_pt * 0.55)))
-    lines           = max(1,  int(height_pt / (font_pt * 1.4)))
-    return chars_per_line * lines
+
+    # 0.55 pts per char width (slightly tighter than old 0.6 — more accurate for common fonts)
+    chars_per_line = max(15, int(width_pt / (font_pt * 0.55)))
+    # 1.4x font size for line height (accounts for typical line spacing)
+    lines = max(1, int(height_pt / (font_pt * 1.4)))
+
+    capacity = chars_per_line * lines
+
+    aspect = width_pt / height_pt if height_pt > 0 else 1
+    if aspect > 2:
+        shape_type = "wide/short"
+    elif aspect < 0.5:
+        shape_type = "narrow/tall"
+    else:
+        shape_type = "balanced"
+
+    return {"capacity": capacity, "shape_type": shape_type, "font_pt": round(font_pt, 1)}
 
 
 def parse_ppt(file_path: str) -> list[dict]:
@@ -71,12 +106,11 @@ def parse_ppt(file_path: str) -> list[dict]:
     prs = Presentation(file_path)
     slides = []
 
-    # Known title-like text patterns
     _title_hints_lower = {
         "presentation title", "section title", "title", "thank you",
         "agenda", "data & insights",
     }
-    _skip_re = re.compile(r'^(\d{1,2}|[↑↓→←★•\|])$')
+    _skip_re = re.compile(r'^(\d{1,2}|[↑↓→←★•\|])')
 
     for i, slide in enumerate(prs.slides):
         layout_name = slide.slide_layout.name if slide.slide_layout else "Unknown"
@@ -103,11 +137,15 @@ def parse_ppt(file_path: str) -> list[dict]:
 
         for top, shape, text in text_shapes:
             hint = text[:100]
-            # Estimate capacity
             try:
-                cap = _emu_to_chars(shape.width, shape.height)
+                # Read actual font size from the shape — fixes the 18pt hardcode bug
+                font_pt = _read_font_pt(shape, fallback=16.0)
+                stats   = _emu_to_chars(shape.width, shape.height, font_pt)
+                cap     = stats["capacity"]
+                stype   = stats["shape_type"]
             except Exception:
-                cap = 300
+                cap   = 300
+                stype = "balanced"
 
             is_t = text.lower() in _title_hints_lower
             is_b = not is_t
@@ -116,15 +154,15 @@ def parse_ppt(file_path: str) -> list[dict]:
                 title_hint = hint
 
             placeholders.append({
-                "idx":       None,
-                "type_code": None,
-                "hint":      hint,
-                "capacity":  cap,
-                "is_title":  is_t,
-                "is_body":   is_b,
+                "idx":        None,
+                "type_code":  None,
+                "hint":       hint,
+                "capacity":   cap,
+                "shape_type": stype,
+                "is_title":   is_t,
+                "is_body":    is_b,
             })
 
-        # If no title found by hint, use the topmost text shape
         if not title_hint and text_shapes:
             title_hint = text_shapes[0][2][:100]
 
@@ -143,29 +181,28 @@ def parse_ppt(file_path: str) -> list[dict]:
 
 def slides_to_prompt_str(slides: list[dict]) -> str:
     """
-    Convert parsed slides to a compact, LLM-readable string.
-    Since this template uses plain text boxes (no placeholders),
-    we describe each slide by its layout name and the text found in its shapes.
+    Fallback prompt string builder (used when layout_intelligence is not available).
+    Prefer layout_intelligence.slides_to_prompt_str() for enriched output.
     """
     lines = []
     for s in slides:
-        # All shapes are non-placeholder text boxes — report them as content hints
         body_shapes = [p for p in s["placeholders"] if p["hint"]]
-        # Use the actual capacity of the largest body shape, fall back to 350
         if body_shapes:
-            max_cap = max(p["capacity"] for p in body_shapes)
-            body_info = f"fillable (capacity ~{max_cap} chars)"
+            max_cap    = max(p["capacity"] for p in body_shapes)
+            best_shape = next(p for p in body_shapes if p["capacity"] == max_cap)
+            stype      = best_shape.get("shape_type", "balanced")
+            body_info  = f"fillable ({stype}, max ~{max_cap} chars)"
         else:
             body_info = "no-content-area"
         title = s["title_hint"] or "(no title)"
         lines.append(
             f"Slide {s['slide_number']} | Layout: {s['layout']} | Title: {title} | Body: {body_info}"
         )
-        for p in body_shapes[:3]:  # show first 3 text hints with their capacities
-            lines.append(f"  Text hint: {p['hint']} (capacity ~{p['capacity']} chars)")
+        for p in body_shapes[:3]:
+            lines.append(f"  Text hint: {p['hint']} (capacity ~{p['capacity']} chars, {p.get('shape_type')})")
     return "\n".join(lines)
 
 
 def slides_to_json(slides: list[dict]) -> str:
-    """Return the full parsed slide data as JSON (stored in session for creator use)."""
+    """Return the full parsed slide data as JSON."""
     return json.dumps(slides)
